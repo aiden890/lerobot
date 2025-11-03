@@ -1,0 +1,12 @@
+python -m lerobot.scripts.server.robot_client \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyACM0 \
+  --robot.cameras="{ wrist: {type: opencv, index_or_path: 4, width: 640, height: 480, fps: 30}, front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30} }" \
+  --robot.id=follower \
+  --task="Grab the blue block and put in the cup" \
+  --server_address=115.145.173.248:8080 \
+  --policy_type=pi0fast \
+  --pretrained_name_or_path=HyeonseokE/pi0_fast_pnp_50epi \
+  --policy_device=cuda \
+  --actions_per_chunk=50 \
+  --debug_visualize_queue_size=True 
