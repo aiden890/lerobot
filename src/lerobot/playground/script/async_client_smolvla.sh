@@ -9,7 +9,7 @@ python -m lerobot.async_inference.robot_client \
   --task="Grab the blue block and put in the cup" \
   --server_address=115.145.175.11:8080 \
   --policy_type=smolvla \
-  --pretrained_name_or_path=cijerezg/smolvla-test \
+  --pretrained_name_or_path=CSI-Agent/smolVLA_pnp144epi_8000 \
   --policy_device=cuda \
   --actions_per_chunk=50 \
   --debug_visualize_queue_size=True 
