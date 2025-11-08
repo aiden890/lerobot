@@ -1,0 +1,24 @@
+python -m lerobot.scripts.lerobot_train \
+  --dataset.repo_id=lerobot/svla_so101_pickplace \
+  --policy.type=pi05 \
+  --output_dir=./outputs/pi05_training \
+  --job_name=pi05_training \
+  --policy.repo_id=khmin101 \
+  --policy.pretrained_path=lerobot/pi05_base \
+  --policy.compile_model=true \
+  --policy.gradient_checkpointing=true \
+  --wandb.enable=true \
+  --policy.dtype=bfloat16 \
+  --steps=30000 \
+  --policy.device=cuda \
+  --batch_size=16 \
+  --save_freq=1000 \
+  --policy.normalization_mapping="{STATE: MEAN_STD, ACTION: MEAN_STD, VISUAL: MEAN_STD}" \
+  --policy.use_vision_lora=64 \
+  --policy.vision_lora_target_modules="[q_proj,k_proj,v_proj,o_proj]" \
+  --policy.use_language_lora=64 \
+  --policy.language_lora_target_modules="[q_proj,k_proj,v_proj,o_proj]" \
+  --policy.use_action_expert_lora=64 \
+  --policy.action_expert_lora_target_modules="[q_proj,k_proj,v_proj,o_proj]" \
+  --policy.lora_alpha=32 \
+  --policy.lora_dropout=0.05

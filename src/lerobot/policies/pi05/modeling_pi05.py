@@ -17,6 +17,7 @@
 import builtins
 import logging
 import math
+import os
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -48,6 +49,20 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
     OPENPI_ATTENTION_MASK_VALUE,
 )
+
+try:  # Optional dependency; only required when LoRA is enabled
+    from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+except ImportError:  # pragma: no cover - we fall back to lazy error when the feature is used
+    LoraConfig = None  # type: ignore[assignment]
+    PeftModel = None  # type: ignore[assignment]
+    TaskType = None  # type: ignore[assignment]
+    get_peft_model = None  # type: ignore[assignment]
+    save_peft_weights = None  # type: ignore[assignment]
+else:
+    try:
+        from peft.utils.save_and_load import save_peft_weights
+    except ImportError:
+        save_peft_weights = None  # type: ignore[assignment]
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -516,6 +531,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             precision=config.dtype,
         )
 
+        self._inject_lora_modules()
+
         self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
 
@@ -539,6 +556,89 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 raise ValueError(msg)
         except ImportError:
             raise ValueError(msg) from None
+
+    def _ensure_peft_available(self):
+        if LoraConfig is None or get_peft_model is None or TaskType is None:
+            raise ImportError(
+                "LoRA features require the 'peft' package. Install it with `pip install peft` to enable "
+                "PI05 LoRA fine-tuning."
+            )
+
+    def _freeze_module_parameters(self, module: nn.Module) -> None:
+        for param in module.parameters():
+            param.requires_grad = False
+
+    @staticmethod
+    def _ensure_prepare_inputs_for_generation(module: nn.Module, module_name: str) -> None:
+        if hasattr(module, "prepare_inputs_for_generation"):
+            return
+
+        def _stub_prepare_inputs_for_generation(*args, **kwargs):
+            raise NotImplementedError(
+                f"prepare_inputs_for_generation is not implemented for {module_name}. "
+                "This stub exists only to satisfy PEFT expectations."
+            )
+
+        setattr(module, "prepare_inputs_for_generation", _stub_prepare_inputs_for_generation)
+
+    def _wrap_with_lora(
+        self,
+        module: nn.Module,
+        rank: int,
+        target_modules: list[str] | None,
+        task_type,
+        module_name: str,
+    ) -> nn.Module:
+        if rank <= 0:
+            return module
+
+        self._ensure_peft_available()
+        logging.info("Enabling LoRA on %s with rank=%s", module_name, rank)
+        self._freeze_module_parameters(module)
+        self._ensure_prepare_inputs_for_generation(module, module_name)
+        lora_config = LoraConfig(
+            r=rank,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+            bias="none",
+            target_modules=target_modules,
+            task_type=task_type,
+        )
+        wrapped_module = get_peft_model(module, lora_config)
+        wrapped_module.print_trainable_parameters()
+        return wrapped_module
+
+    def _inject_lora_modules(self) -> None:
+        cfg = self.config
+        paligemma = self.paligemma_with_expert.paligemma
+        gemma_expert = self.paligemma_with_expert.gemma_expert
+
+        if cfg.use_language_lora > 0:
+            paligemma.language_model = self._wrap_with_lora(
+                paligemma.language_model,
+                cfg.use_language_lora,
+                cfg.language_lora_target_modules,
+                TaskType.CAUSAL_LM if TaskType is not None else None,
+                "paligemma.language_model",
+            )
+
+        if cfg.use_vision_lora > 0:
+            paligemma.vision_tower = self._wrap_with_lora(
+                paligemma.vision_tower,
+                cfg.use_vision_lora,
+                cfg.vision_lora_target_modules,
+                TaskType.FEATURE_EXTRACTION if TaskType is not None else None,
+                "paligemma.vision_tower",
+            )
+
+        if cfg.use_action_expert_lora > 0:
+            gemma_expert.model = self._wrap_with_lora(
+                gemma_expert.model,
+                cfg.use_action_expert_lora,
+                cfg.action_expert_lora_target_modules,
+                TaskType.CAUSAL_LM if TaskType is not None else None,
+                "gemma_expert.model",
+            )
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -849,6 +949,134 @@ class PI05Policy(PreTrainedPolicy):
 
         self.reset()
 
+    def _save_pretrained(self, save_directory: Path) -> None:
+        super()._save_pretrained(save_directory)
+        self._save_lora_adapters(save_directory)
+
+    def _save_lora_adapters(self, save_directory: Path) -> None:
+        if get_peft_model is None:
+            return
+
+        paligemma = self.model.paligemma_with_expert.paligemma
+        adapters = [
+            ("vision", getattr(paligemma.model, "vision_tower", paligemma.vision_tower), self.config.use_vision_lora),
+            (
+                "language",
+                getattr(paligemma.model, "language_model", paligemma.language_model),
+                self.config.use_language_lora,
+            ),
+            ("action_expert", self.model.paligemma_with_expert.gemma_expert.model, self.config.use_action_expert_lora),
+        ]
+
+        adapters_root = save_directory / "lora_adapters"
+        saved_any = False
+
+        for name, module, rank in adapters:
+            if rank <= 0:
+                continue
+            target_module = self._resolve_peft_save_target(module)
+            if target_module is None or not hasattr(target_module, "save_pretrained"):
+                logging.warning(
+                    "Module '%s' does not expose `save_pretrained` (or nested PEFT wrapper not found), skipping LoRA save.",
+                    name,
+                )
+                continue
+
+            target_dir = adapters_root / name
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if save_peft_weights is not None and hasattr(target_module, "peft_config"):
+                save_peft_weights(target_module, str(target_dir))
+            elif hasattr(target_module, "save_pretrained"):
+                target_module.save_pretrained(target_dir)
+            else:
+                logging.warning("Module '%s' cannot be serialized (no PEFT save helpers).", name)
+                continue
+
+            logging.info("Saved LoRA adapter for %s to %s", name, target_dir)
+            saved_any = True
+
+        if not saved_any and adapters_root.exists():
+            try:
+                adapters_root.rmdir()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _resolve_peft_save_target(module: nn.Module) -> nn.Module | None:
+        """
+        Finds the actual PEFT-wrapped module that exposes `save_pretrained`.
+
+        Some wrappers (e.g. paligemma.vision_tower) store the PEFT model under nested attributes like `.model`
+        or `.vision_model`, so we check a list of common attribute names.
+        """
+        if hasattr(module, "save_pretrained"):
+            return module
+
+        candidate_attrs = [
+            "model",
+            "vision_model",
+            "language_model",
+            "base_model",
+            "module",
+        ]
+        for attr in candidate_attrs:
+            nested = getattr(module, attr, None)
+            if nested is not None and hasattr(nested, "save_pretrained"):
+                return nested
+
+        return None
+
+    def _reload_lora_module(self, module: nn.Module, adapter_dir: Path, module_name: str) -> nn.Module:
+        if adapter_dir is None or not adapter_dir.exists():
+            return module
+        if PeftModel is None:
+            logging.warning("peft is not installed, cannot reload LoRA adapter for %s", module_name)
+            return module
+
+        base_model = self._resolve_peft_save_target(module)
+        if base_model is None:
+            base_model = module.get_base_model() if hasattr(module, "get_base_model") else module
+
+        logging.info("Loading LoRA adapter for %s from %s", module_name, adapter_dir)
+        return PeftModel.from_pretrained(base_model, str(adapter_dir), is_trainable=True)
+
+    def _load_lora_adapters(self, checkpoint_dir: Path) -> None:
+        if get_peft_model is None:
+            return
+        adapters_root = checkpoint_dir / "lora_adapters"
+        if not adapters_root.exists():
+            return
+
+        paligemma = self.model.paligemma_with_expert.paligemma
+        gemma_expert = self.model.paligemma_with_expert.gemma_expert
+
+        if self.config.use_vision_lora > 0:
+            adapter_dir = adapters_root / "vision"
+            if (adapter_dir / "adapter_config.json").exists():
+                paligemma.vision_tower = self._reload_lora_module(
+                    paligemma.vision_tower, adapter_dir, "paligemma.vision_tower"
+                )
+            else:
+                logging.warning("LoRA adapter for vision not found at %s, skipping reload.", adapter_dir)
+
+        if self.config.use_language_lora > 0:
+            adapter_dir = adapters_root / "language"
+            if (adapter_dir / "adapter_config.json").exists():
+                paligemma.language_model = self._reload_lora_module(
+                    paligemma.language_model, adapter_dir, "paligemma.language_model"
+                )
+            else:
+                logging.warning("LoRA adapter for language not found at %s, skipping reload.", adapter_dir)
+
+        if self.config.use_action_expert_lora > 0:
+            adapter_dir = adapters_root / "action_expert"
+            if (adapter_dir / "adapter_config.json").exists():
+                gemma_expert.model = self._reload_lora_module(
+                    gemma_expert.model, adapter_dir, "gemma_expert.model"
+                )
+            else:
+                logging.warning("LoRA adapter for action_expert not found at %s, skipping reload.", adapter_dir)
+
     @classmethod
     def from_pretrained(
         cls: builtins.type[T],
@@ -969,6 +1197,9 @@ class PI05Policy(PreTrainedPolicy):
         except Exception as e:
             print(f"Warning: Could not remap state dict keys: {e}")
 
+        if os.path.isdir(pretrained_name_or_path):
+            model._load_lora_adapters(Path(pretrained_name_or_path))
+
         return model
 
     def _fix_pytorch_state_dict_keys(
@@ -1026,7 +1257,32 @@ class PI05Policy(PreTrainedPolicy):
         return fixed_state_dict
 
     def get_optim_params(self) -> dict:
-        return self.parameters()
+        trainable = [(name, param) for name, param in self.named_parameters() if param.requires_grad]
+        if not trainable:
+            return self.parameters()
+
+        lora_params: list[Tensor] = []
+        base_params: list[Tensor] = []
+        for name, param in trainable:
+            if "lora_" in name:
+                lora_params.append(param)
+            else:
+                base_params.append(param)
+
+        param_groups: list[dict] = []
+        if base_params:
+            param_groups.append({"params": base_params})
+
+        if lora_params:
+            lora_group: dict = {"params": lora_params}
+            lora_lr = self.config.optimizer_lr * self.config.lora_lr_multiplier
+            if self.config.lora_lr_multiplier != 1.0:
+                lora_group["lr"] = lora_lr
+            if self.config.lora_weight_decay is not None:
+                lora_group["weight_decay"] = self.config.lora_weight_decay
+            param_groups.append(lora_group)
+
+        return param_groups
 
     def reset(self):
         """Reset internal state - called when environment resets."""
