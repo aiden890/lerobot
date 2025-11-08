@@ -82,6 +82,17 @@ class PI05Config(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
+    # LoRA fine-tuning controls
+    use_vision_lora: int = 0  # LoRA rank for Paligemma vision tower (0 disables)
+    use_language_lora: int = 0  # LoRA rank for Paligemma language model / expert
+    use_action_expert_lora: int = 0  # LoRA rank for action expert head
+    lora_alpha: int = 16
+    lora_dropout: float = 0.1
+    vision_lora_target_modules: list[str] | None = None
+    language_lora_target_modules: list[str] | None = None
+    action_expert_lora_target_modules: list[str] | None = None
+    lora_lr_multiplier: float = 1.0
+    lora_weight_decay: float | None = None
 
     def __post_init__(self):
         super().__post_init__()

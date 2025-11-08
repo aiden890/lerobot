@@ -234,6 +234,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             action_chunk = self._predict_action_chunk(obs)
             inference_time = time.perf_counter() - start_time
 
+            for action in action_chunk:  # keep serialization fully CPU-bound
+                action.action = action.action.detach().cpu()
+
             start_time = time.perf_counter()
             actions_bytes = pickle.dumps(action_chunk)  # nosec
             serialize_time = time.perf_counter() - start_time
