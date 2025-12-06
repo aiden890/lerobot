@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import logging
+import threading
+import time
 from functools import cached_property
 from itertools import chain
 from typing import Any
@@ -72,6 +74,12 @@ class LeKiwi(Robot):
         self.base_motors = [motor for motor in self.bus.motors if motor.startswith("base")]
         self.cameras = make_cameras_from_configs(config.cameras)
 
+        # Async camera frame capture
+        self._camera_threads: dict[str, threading.Thread] = {}
+        self._camera_locks: dict[str, threading.Lock] = {}
+        self._cached_frames: dict[str, np.ndarray] = {}
+        self._camera_shutdown_event = threading.Event()
+
     @property
     def _state_ft(self) -> dict[str, type]:
         return dict.fromkeys(
@@ -123,7 +131,59 @@ class LeKiwi(Robot):
 
         self.configure()
 
+        # Start async camera capture threads
+        self._start_camera_threads()
+
         logger.info(f"{self} connected.")
+
+    def _start_camera_threads(self) -> None:
+        """Start background threads for each camera to continuously capture frames."""
+        self._camera_shutdown_event.clear()
+        for cam_key in self.cameras.keys():
+            lock = threading.Lock()
+            self._camera_locks[cam_key] = lock
+
+            thread = threading.Thread(
+                target=self._camera_capture_loop,
+                args=(cam_key,),
+                name=f"camera_{cam_key}",
+                daemon=True
+            )
+            self._camera_threads[cam_key] = thread
+            thread.start()
+            logger.info(f"Started async capture thread for camera '{cam_key}'")
+
+    def _camera_capture_loop(self, cam_key: str) -> None:
+        """Background thread that continuously captures frames from a camera."""
+        logger.info(f"Camera capture loop for '{cam_key}' started")
+        cam = self.cameras[cam_key]
+
+        while not self._camera_shutdown_event.is_set():
+            try:
+                # Capture frame
+                frame = cam.async_read()
+
+                # Update cached frame thread-safely
+                with self._camera_locks[cam_key]:
+                    self._cached_frames[cam_key] = frame
+
+            except Exception as e:
+                logger.error(f"Error in camera capture loop for '{cam_key}': {e}")
+
+            # Small sleep to target ~30fps per camera
+            time.sleep(1.0 / 30.0)
+
+        logger.info(f"Camera capture loop for '{cam_key}' stopped")
+
+    def _stop_camera_threads(self) -> None:
+        """Stop all camera capture threads."""
+        self._camera_shutdown_event.set()
+        for cam_key, thread in self._camera_threads.items():
+            if thread.is_alive():
+                thread.join(timeout=1.0)
+                logger.info(f"Stopped async capture thread for camera '{cam_key}'")
+        self._camera_threads.clear()
+        self._camera_locks.clear()
 
     @property
     def is_calibrated(self) -> bool:
@@ -355,9 +415,16 @@ class LeKiwi(Robot):
         arm_state = {f"{k}.pos": v for k, v in arm_pos.items()}
         obs_dict = {**arm_state, **base_vel}
 
-        # Capture images from cameras synchronously
-        for cam_key, cam in self.cameras.items():
-            obs_dict[cam_key] = cam.async_read()
+        # Get cached camera frames (non-blocking)
+        for cam_key in self.cameras.keys():
+            with self._camera_locks[cam_key]:
+                # Use cached frame if available, otherwise use black frame
+                if cam_key in self._cached_frames:
+                    obs_dict[cam_key] = self._cached_frames[cam_key].copy()
+                else:
+                    # No frame cached yet, use empty frame
+                    cam_config = self.config.cameras[cam_key]
+                    obs_dict[cam_key] = np.zeros((cam_config.height, cam_config.width, 3), dtype=np.uint8)
 
         return obs_dict
 
@@ -406,6 +473,9 @@ class LeKiwi(Robot):
     def disconnect(self):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        # Stop camera capture threads
+        self._stop_camera_threads()
 
         self.stop_base()
         self.bus.disconnect(self.config.disable_torque_on_disconnect)

@@ -1,0 +1,86 @@
+계획 (싱글 컨트롤 루프 + 정책 수신 워커)
+
+공유 상태 정의
+
+LatestActionBuffer: 워커 스레드가 gRPC GetActions에서 받은 TimedAction 리스트를 넣으면 해당 리스트 전체를 디코드.
+리스트 내부는 이미 시점 순으로 정렬되어 있으니, 이를 통째로 LatestActionBuffer에 저장하되, 버퍼 자체는 “가장 최근 리스트 하나만” 보관하도록 합니다.
+
+FSMState + CurrentAction: 컨트롤 루프가 FSM 결과로 결정한 “이번 틱에 전송할 액션”을 저장하는 구조. 프리셋 경로 진행도와 pick/place 플래그도 여기 포함.
+
+
+워커 스레드 (정책 수신)
+
+기존 PolicyServerPickPlaceController에서 gRPC 핸드셰이크·GetActions 호출만 추출.
+무한 루프로 최신 TimedAction들을 받아 LatestActionBuffer에 갱신.
+에러 발생 시 재시도(백오프) 로직만 추가.
+싱글 컨트롤 루프
+
+주기(예: max_loop_freq_hz)에 맞춰 while running:
+fsm.step(pending_command) 호출 → 현재 state 갱신.
+state가 PICK이면 LatestActionBuffer에서 최신 액션을 가져와 베이스 속도를 0으로 필터링. 없으면 직전 액션 유지 또는 안전 정지.
+state가 경로 이동이면 프리셋 시퀀스에서 다음 액션을 뽑거나 경로 완료 시 motion_done flag 세팅.
+결정된 CurrentAction을 lekiwi에 robot.send_action(...)으로 전송.
+즉시 robot.get_observation()을 호출해 관측을 얻고, policy 서버로 SendObservations 호출(동기). 네트워크 지연이 너무 크면 관측 전송만 별도 비동기 큐에 넣어 처리.
+루프 마지막에 sleep(max(0, period - elapsed))로 주기 유지.
+커맨드 입력 및 종료 처리
+
+FSM에 들어갈 외부 명령(START/STOP)은 별도 큐나 이벤트로 받아 컨트롤 루프가 읽도록 함.
+종료 시 워커 스레드에 이벤트를 보내고 gRPC 채널/로봇 연결을 정리.
+
+
+
+
+python src/lerobot/robots/lekiwi/pick_move_place_fsm.py \
+    pick_place_control_loop \
+    --controller.server_address=10.0.0.5:8080 \
+    --controller.policy_config.policy_type=act \
+    --controller.policy_config.pretrained_name_or_path=hf_user/model \
+    --controller.policy_config.actions_per_chunk=32 \
+    --controller.policy_config.device=cuda \
+    --controller.environment_dt=0.033 \
+    --controller.task="pick_and_place" \
+    --controller.preset_datasets.pick_to_place.repo_id=hf_user/lekiwi_pick_to_place \
+    --controller.preset_datasets.pick_to_place.episode_index=0 \
+    --controller.preset_datasets.place_to_pick.repo_id=/path/to/local_dataset/place_to_pick \
+    --controller.preset_datasets.place_to_pick.episode_index=0 \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=blue \
+    --robot.cameras='{front:{type:opencv,index_or_path:/dev/video0,width:640,height:480,fps:30}}' \
+    --fsm.pick_to_place_path=pick_to_place \
+    --fsm.place_to_pick_path=place_to_pick \
+    --target_hz=20 \
+    --auto_start=True
+
+
+
+PickPlaceConfig
+
+pick_to_place_path: 프리셋 경로 이름
+place_to_pick_path: 프리셋 경로 이름
+
+
+PresetDatasetConfig
+
+repo_id: 프리셋 액션이 담긴 HF 데이터셋 or 로컬 경로
+episode_index: 사용할 에피소드 번호
+
+
+PolicyServerExecutorConfig
+
+server_address: 정책 서버 gRPC 주소
+policy_config: RemotePolicyConfig (policy_type, pretrained_name_or_path, actions_per_chunk, device, lerobot_features 등)
+environment_dt: 컨트롤 주기 (초)
+logger_name: 로깅 이름
+task: 관측에 포함할 태스크 문자열
+preset_datasets: {path_id: PresetDatasetConfig} 매핑
+gripper_open_threshold: gripper.open 판정 각도
+gripper_open_duration_s: 해당 각도를 유지해야 하는 시간
+
+
+PickPlaceLoopConfig
+
+controller: 위 PolicyServerExecutorConfig
+robot: LeKiwiClientConfig (원격 IP, 포트 등)
+fsm: PickPlaceConfig
+target_hz: 메인 루프 주파수
+auto_start: 시작 시 FSM을 자동으로 START 시킬지 여부

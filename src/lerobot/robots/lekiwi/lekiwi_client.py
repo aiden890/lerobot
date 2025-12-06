@@ -17,6 +17,7 @@
 import base64
 import json
 import logging
+import time
 from functools import cached_property
 from typing import Any
 
@@ -24,6 +25,8 @@ import cv2
 import numpy as np
 
 from lerobot.utils.constants import ACTION, OBS_STATE
+
+logger = logging.getLogger(__name__)
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..robot import Robot
@@ -55,6 +58,16 @@ class LeKiwiClient(Robot):
         self.zmq_context = None
         self.zmq_cmd_socket = None
         self.zmq_observation_socket = None
+
+        # Statistics for _get_data
+        self._get_data_total = 0
+        self._get_data_cached = 0
+        self._get_data_last_log_time = time.time()
+
+        # Data arrival rate tracking
+        self._last_new_message_time: float = 0.0
+        self._message_intervals: list[float] = []
+        self._message_interval_window: int = 30  # Track last 30 messages
 
         self.last_frames = {}
 
@@ -152,11 +165,10 @@ class LeKiwiClient(Robot):
         try:
             socks = dict(poller.poll(self.polling_timeout_ms))
         except zmq.ZMQError as e:
-            logging.error(f"ZMQ polling error: {e}")
+            logger.error(f"ZMQ polling error: {e}")
             return None
 
         if self.zmq_observation_socket not in socks:
-            logging.info("No new data available within timeout.")
             return None
 
         last_msg = None
@@ -168,7 +180,7 @@ class LeKiwiClient(Robot):
                 break
 
         if last_msg is None:
-            logging.warning("Poller indicated data, but failed to retrieve message.")
+            logger.warning("Poller indicated data, but failed to retrieve message.")
 
         return last_msg
 
@@ -177,7 +189,7 @@ class LeKiwiClient(Robot):
         try:
             return json.loads(obs_string)
         except json.JSONDecodeError as e:
-            logging.error(f"Error decoding JSON observation: {e}")
+            logger.error(f"Error decoding JSON observation: {e}")
             return None
 
     def _decode_image_from_b64(self, image_b64: str) -> np.ndarray | None:
@@ -189,10 +201,10 @@ class LeKiwiClient(Robot):
             np_arr = np.frombuffer(jpg_data, dtype=np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             if frame is None:
-                logging.warning("cv2.imdecode returned None for an image.")
+                logger.warning("cv2.imdecode returned None for an image.")
             return frame
         except (TypeError, ValueError) as e:
-            logging.error(f"Error decoding base64 image data: {e}")
+            logger.error(f"Error decoding base64 image data: {e}")
             return None
 
     def _remote_state_from_obs(
@@ -217,6 +229,17 @@ class LeKiwiClient(Robot):
 
         return current_frames, obs_dict
 
+    def _log_get_data_stats(self) -> None:
+        """Log _get_data statistics every 5 seconds."""
+        now = time.time()
+        if now - self._get_data_last_log_time >= 5.0:
+            if self._get_data_total > 0:
+                cache_rate = (self._get_data_cached / self._get_data_total) * 100
+                logger.info(f"_get_data stats: {self._get_data_cached}/{self._get_data_total} cached ({cache_rate:.1f}%)")
+            self._get_data_total = 0
+            self._get_data_cached = 0
+            self._get_data_last_log_time = now
+
     def _get_data(self) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, Any]]:
         """
         Polls the video socket for the latest observation data.
@@ -225,31 +248,62 @@ class LeKiwiClient(Robot):
         If successful, updates and returns the new frames, speed, and arm state.
         If no new data arrives or decoding fails, returns the last known values.
         """
+        self._get_data_total += 1
 
         # 1. Get the latest message string from the socket
         latest_message_str = self._poll_and_get_latest_message()
 
         # 2. If no message, return cached data
         if latest_message_str is None:
+            self._get_data_cached += 1
+            # Debug: log every 30th cache hit to show data is not arriving
+            if self._get_data_cached % 30 == 1:
+                print(f"[DataRate] No new data (cached {self._get_data_cached}/{self._get_data_total})")
+            self._log_get_data_stats()
             return self.last_frames, self.last_remote_state
 
         # 3. Parse the JSON message
         observation = self._parse_observation_json(latest_message_str)
 
+        # Track message arrival rate
+        current_time = time.perf_counter()
+        if self._last_new_message_time > 0:
+            interval = (current_time - self._last_new_message_time) * 1000  # ms
+            self._message_intervals.append(interval)
+            if len(self._message_intervals) > self._message_interval_window:
+                self._message_intervals.pop(0)
+            # Log every ~1 second (when we have enough samples)
+            if len(self._message_intervals) >= self._message_interval_window:
+                avg_interval = sum(self._message_intervals) / len(self._message_intervals)
+                avg_hz = 1000 / avg_interval if avg_interval > 0 else 0
+                print(f"[DataRate] Avg interval: {avg_interval:.1f}ms ({avg_hz:.1f} Hz)")
+                self._message_intervals.clear()  # Reset after logging
+        else:
+            print("[DataRate] First new message received")
+        self._last_new_message_time = current_time
+
         # 4. If JSON parsing failed, return cached data
         if observation is None:
+            self._get_data_cached += 1
+            self._log_get_data_stats()
             return self.last_frames, self.last_remote_state
 
         # 5. Process the valid observation data
         try:
             new_frames, new_state = self._remote_state_from_obs(observation)
         except Exception as e:
-            logging.error(f"Error processing observation data, serving last observation: {e}")
+            logger.error(f"Error processing observation data, serving last observation: {e}")
+            self._get_data_cached += 1
+            self._log_get_data_stats()
             return self.last_frames, self.last_remote_state
+
+        # Add receive timestamp to observation (client-side, for latency tracking)
+        new_state["_receive_timestamp"] = current_time  # time.perf_counter() value
 
         self.last_frames = new_frames
         self.last_remote_state = new_state
 
+        self._log_get_data_stats()
         return new_frames, new_state
 
     def get_observation(self) -> dict[str, Any]:
@@ -266,7 +320,7 @@ class LeKiwiClient(Robot):
         # Loop over each configured camera
         for cam_name, frame in frames.items():
             if frame is None:
-                logging.warning("Frame is None")
+                logger.warning("Frame is None")
                 frame = np.zeros((640, 480, 3), dtype=np.uint8)
             obs_dict[cam_name] = frame
 

@@ -46,6 +46,11 @@ When implementing a new policy class (e.g. `DiffusionPolicy`) follow these steps
 
 import itertools
 
+from lerobot.utils.torch_compat import ensure_transform_getitem_to_index as _ensure_transform_getitem_to_index
+
+_ensure_transform_getitem_to_index()
+del _ensure_transform_getitem_to_index
+
 from lerobot.__version__ import __version__  # noqa: F401
 
 # TODO(rcadene): Improve policies and envs. As of now, an item in `available_policies`

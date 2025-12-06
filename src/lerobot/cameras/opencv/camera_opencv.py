@@ -370,15 +370,22 @@ class OpenCVCamera(Camera):
         if self.videocapture is None:
             raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
 
+        t0 = time.perf_counter()
         ret, frame = self.videocapture.read()
+        t_hw_read = (time.perf_counter() - t0) * 1e3
 
         if not ret or frame is None:
             raise RuntimeError(f"{self} read failed (status={ret}).")
 
+        t0 = time.perf_counter()
         processed_frame = self._postprocess_image(frame, color_mode)
+        t_postprocess = (time.perf_counter() - t0) * 1e3
 
         read_duration_ms = (time.perf_counter() - start_time) * 1e3
-        logger.debug(f"{self} read took: {read_duration_ms:.1f}ms")
+        print(
+            f"{self} read timings (ms): hw_read={t_hw_read:.1f}, "
+            f"postprocess={t_postprocess:.1f}, total={read_duration_ms:.1f}"
+        )
 
         return processed_frame
 
@@ -441,11 +448,26 @@ class OpenCVCamera(Camera):
 
         while not self.stop_event.is_set():
             try:
+                loop_start = time.perf_counter()
+                
+                t0 = time.perf_counter()
                 color_image = self.read()
-
+                t_read = (time.perf_counter() - t0) * 1e3
+                
+                t0 = time.perf_counter()
                 with self.frame_lock:
                     self.latest_frame = color_image
+                t_store = (time.perf_counter() - t0) * 1e3
+                
+                t0 = time.perf_counter()
                 self.new_frame_event.set()
+                t_event = (time.perf_counter() - t0) * 1e3
+                
+                loop_total = (time.perf_counter() - loop_start) * 1e3
+                print(
+                    f"[BG Thread] {self} timings (ms): read={t_read:.1f}, "
+                    f"store={t_store:.1f}, event={t_event:.1f}, total={loop_total:.1f}"
+                )
 
             except DeviceNotConnectedError:
                 break
@@ -496,25 +518,39 @@ class OpenCVCamera(Camera):
             TimeoutError: If no frame becomes available within the specified timeout.
             RuntimeError: If an unexpected error occurs.
         """
+        t_start = time.perf_counter()
+        
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
+        t0 = time.perf_counter()
         if self.thread is None or not self.thread.is_alive():
             self._start_read_thread()
+        t_thread_check = (time.perf_counter() - t0) * 1e3
 
+        t0 = time.perf_counter()
         if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
             thread_alive = self.thread is not None and self.thread.is_alive()
             raise TimeoutError(
                 f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
                 f"Read thread alive: {thread_alive}."
             )
+        t_wait = (time.perf_counter() - t0) * 1e3
 
+        t0 = time.perf_counter()
         with self.frame_lock:
             frame = self.latest_frame
             self.new_frame_event.clear()
+        t_lock = (time.perf_counter() - t0) * 1e3
 
         if frame is None:
             raise RuntimeError(f"Internal error: Event set but no frame available for {self}.")
+
+        t_total = (time.perf_counter() - t_start) * 1e3
+        print(
+            f"{self} async_read timings (ms): thread_check={t_thread_check:.1f}, "
+            f"wait={t_wait:.1f}, lock={t_lock:.1f}, total={t_total:.1f}"
+        )
 
         return frame
 

@@ -1,0 +1,39 @@
+controller:
+  environment_dt: 0.0333
+  logger_name: lekiwi_local_executor
+  task: "pick green object and put it on the green"
+  preset_datasets:
+    pick_to_place:
+      repo_id: khmin101/poc2_demo2
+      episode_index: 0
+    place_to_pick:
+      repo_id: khmin101/goto_pick_ver1
+      episode_index: 0
+  policy_config:
+    policy_type: act
+    pretrained_name_or_path: khmin101/poc2_ver5_pick_100
+    actions_per_chunk: 100
+    device: mps  # MacBook GPU (Metal Performance Shaders)
+  gripper_open_threshold: 70.0
+  gripper_open_duration_s: 0.5
+  gripper_closed_threshold: 30.0
+  gripper_closed_duration_s: 0.5
+  gripper_stable_range: 5.0
+  queue_refill_threshold: 0.6  # Refill when queue is below 20%
+robot:
+  remote_ip: 192.168.20.199
+  port_zmq_cmd: 5555
+  port_zmq_observations: 5556
+  id: lekiwi
+  cameras:
+    front:
+      type: opencv
+      index_or_path: /dev/video0
+      width: 640
+      height: 480
+      fps: 30
+fsm:
+  pick_to_place_path: pick_to_place
+  place_to_pick_path: place_to_pick
+target_hz: 30
+auto_start: true

@@ -1,0 +1,109 @@
+# Trajectory Control Configuration
+# ================================
+
+# HuggingFace Dataset URLs
+# ------------------------
+# Record your trajectories and upload to HuggingFace, then fill in the URLs below
+datasets:
+  # Pick: approach trajectory, then close gripper (0), return to init
+  approach_pick: "khmin101/poc2_TC_pick"    # initial -> object approach (distance proportional)
+
+  # Place: approach trajectory, then open gripper, return to init
+  approach_place: "khmin101/poc2_TC_place"  # initial -> place position approach (distance proportional)
+
+# Robot Configuration
+# -------------------
+robot:
+  remote_ip: "192.168.20.199"
+  fps: 30
+  port_zmq_cmd: 5555
+  port_zmq_observations: 5556
+
+# Camera Configuration
+# --------------------
+camera:
+  name: front                    # Camera name in observation dict
+  obs_key: "front"  # Key to access image in observation
+  type: opencv
+  index_or_path: /dev/video0
+  width: 640
+  height: 480
+  color_format: "rgb"            # Input format: "rgb" or "bgr" (OpenCV uses BGR internally)
+
+# Camera Calibration
+# -------------------
+# Robot origin is below the camera view, so we need offset correction
+calibration:
+  # Robot origin offset: pixels below the bottom of the camera image (y=height)
+  # If robot origin is 130px below y=480, virtual origin is at y=610
+  robot_origin_offset_px: 130
+
+  # Image center X (for direction calculation)
+  image_center_x: 320
+
+  # Direction calibration: map pixel position to shoulder_pan value
+  # The angle is calculated from robot origin to the pixel point
+  # Format: (pixel_x, pixel_y) -> shoulder_pan motor value
+  direction:
+    reference_y: 346          # Y coordinate of calibration points
+    points:
+      - pixel_x: 220
+        shoulder_pan: -18.0
+      - pixel_x: 320
+        shoulder_pan: 0.0     # Center (straight ahead)
+      - pixel_x: 420
+        shoulder_pan: 18.0
+
+# Distance Calibration
+# --------------------
+# Map pixel distance to trajectory timestep
+# Recorded by running: python -m lerobot.robots.lekiwi.trajectory_control.calibrate_distance
+distance:
+  pick:
+    # Nearest point (arm fully extended toward camera)
+    near:
+      timestep: 227           # pixel (259, 303)
+      pixel_distance: 313.0   # sqrt((259-320)^2 + (610-303)^2)
+    # Farthest point (arm reaches farthest from camera)
+    far:
+      timestep: 304           # pixel (258, 237)
+      pixel_distance: 378.1   # sqrt((258-320)^2 + (610-237)^2)
+  place:
+    near:
+      timestep: 76            # pixel (321, 310)
+      pixel_distance: 300.0   # sqrt((321-320)^2 + (610-310)^2)
+    far:
+      timestep: 195           # pixel (345, 77)
+      pixel_distance: 533.6   # sqrt((345-320)^2 + (610-77)^2)
+
+# Motion Configuration
+# --------------------
+motion:
+  return_steps: 60        # Number of interpolation steps when returning to initial
+  gripper_open: 50.0      # Gripper open value
+  gripper_close: 1.0     # Gripper close value
+  gripper_duration: 1.0   # Gripper action duration in seconds
+  shoulder_pan_speed: 30.0  # Shoulder pan movement speed in degrees per second
+
+# Color Detection HSV Ranges
+# --------------------------
+# Adjust these values based on your lighting conditions
+color_detection:
+  pink:
+    lower: [140, 10, 130]    # HSV lower bound
+    upper: [180, 255, 255]  # HSV upper bound
+    kernel_size: 5           # Morphological kernel size (smaller = detect smaller objects)
+  black:
+    lower: [0, 0, 0]
+    upper: [180, 255, 100]
+    kernel_size: 0           # Use smaller kernel for small black dots
+  min_area: 200            # Minimum contour area in pixels
+
+# ROI (Region of Interest) Configuration
+# --------------------------------------
+# Define detection regions as normalized coordinates (0.0 to 1.0)
+# Format: [x, y, width, height] where (x, y) is top-left corner
+# Set to null or omit to use full image
+roi:
+  pink: [0.1, 0.2, 0.8, 0.7]    # ROI for pick (pink object detection)
+  black: [0.1, 0.2, 0.35, 0.5]   # ROI for place (black region detection)

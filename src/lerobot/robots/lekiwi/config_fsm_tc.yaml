@@ -1,0 +1,24 @@
+# FSM Configuration for Trajectory Control
+# =========================================
+
+robot:
+  remote_ip: 192.168.20.199
+  port_zmq_cmd: 5555
+  port_zmq_observations: 5556
+  id: lekiwi
+  cameras:
+    front:
+      type: opencv
+      index_or_path: /dev/video0
+      width: 640
+      height: 480
+      fps: 30
+
+fsm:
+  pick_to_place_path: pick_to_place
+  place_to_pick_path: place_to_pick
+
+target_hz: 30
+auto_start: true
+infinite_loop: true  # Enable infinite loop (GOTO_PICK -> IDLE -> auto PICK)
+require_manual_transition: false  # Require 'n' key to transition between states

@@ -45,10 +45,6 @@ def send_bytes_in_chunks(buffer: bytes, message_class: Any, log_prefix: str = ""
 
     sent_bytes = 0
 
-    logging_method = logging.info if not silent else logging.debug
-
-    logging_method(f"{log_prefix} Buffer size {size_in_bytes / 1024 / 1024} MB with")
-
     while sent_bytes < size_in_bytes:
         transfer_state = services_pb2.TransferState.TRANSFER_MIDDLE
 
@@ -62,9 +58,6 @@ def send_bytes_in_chunks(buffer: bytes, message_class: Any, log_prefix: str = ""
 
         yield message_class(transfer_state=transfer_state, data=chunk)
         sent_bytes += size_to_read
-        logging_method(f"{log_prefix} Sent {sent_bytes}/{size_in_bytes} bytes with state {transfer_state}")
-
-    logging_method(f"{log_prefix} Published {sent_bytes / 1024 / 1024} MB")
 
 
 def receive_bytes_in_chunks(iterator, queue: Queue | None, shutdown_event: Event, log_prefix: str = ""):
